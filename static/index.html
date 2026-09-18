@@ -1,0 +1,313 @@
+<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Reconhecimento Facial</title>
+<style>
+  :root {
+    --bg: #0f1115;
+    --card: #1a1d24;
+    --border: #2a2e37;
+    --text: #e8eaed;
+    --muted: #9aa0a6;
+    --accent: #4f8cff;
+    --green: #2ecc71;
+    --red: #e74c3c;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    display: flex;
+    justify-content: center;
+    padding: 32px 16px 80px;
+  }
+  .wrap { width: 100%; max-width: 480px; }
+  h1 { font-size: 20px; text-align: center; margin-bottom: 4px; }
+  p.sub { text-align: center; color: var(--muted); margin-top: 0; margin-bottom: 24px; font-size: 13px; }
+
+  .card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    padding: 18px;
+    margin-bottom: 18px;
+  }
+
+  video {
+    width: 100%;
+    border-radius: 10px;
+    background: #000;
+    transform: scaleX(-1); /* efeito espelho, só visual */
+    display: block;
+  }
+
+  .buttons { display: flex; gap: 10px; margin-top: 10px; }
+
+  button {
+    flex: 1;
+    padding: 12px 10px;
+    border-radius: 8px;
+    border: none;
+    font-size: 14px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: opacity 0.15s;
+  }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+  button:hover:not(:disabled) { opacity: 0.85; }
+
+  .btn-verify   { background: var(--accent); color: white; }
+  .btn-ghost    { background: transparent; color: var(--muted); border: 1px solid var(--border); font-weight: 500; font-size: 12px; padding: 8px; }
+
+  .status {
+    margin-top: 14px;
+    padding: 14px;
+    border-radius: 10px;
+    font-size: 15px;
+    text-align: center;
+    display: none;
+  }
+  .status.show { display: block; }
+  .status.info    { background: #1e2530; color: var(--muted); }
+  .status.success { background: rgba(46, 204, 113, 0.12); color: var(--green); border: 1px solid rgba(46,204,113,0.4); }
+  .status.error   { background: rgba(231, 76, 60, 0.12); color: var(--red); border: 1px solid rgba(231,76,60,0.4); }
+  .status .sim { display: block; font-size: 12px; color: var(--muted); margin-top: 4px; font-weight: 400; }
+
+  .section-title { font-size: 13px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); margin-bottom: 10px; }
+
+  ul#face-list { list-style: none; padding: 0; margin: 0; }
+  ul#face-list li {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 8px 0;
+    border-bottom: 1px solid var(--border);
+    font-size: 14px;
+  }
+  ul#face-list li:last-child { border-bottom: none; }
+  ul#face-list img {
+    width: 40px; height: 40px;
+    border-radius: 50%;
+    object-fit: cover;
+    background: #11141a;
+    border: 1px solid var(--border);
+  }
+  ul#face-list .cpf { color: var(--muted); font-size: 12px; display: block; }
+  ul#access-list { list-style: none; padding: 0; margin: 0; }
+  ul#access-list li {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 0;
+    border-bottom: 1px solid var(--border);
+    font-size: 14px;
+  }
+  ul#access-list li:last-child { border-bottom: none; }
+  .empty { color: var(--muted); font-size: 13px; text-align: center; padding: 8px 0; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>🔐 Reconhecimento Facial</h1>
+  <p class="sub">Aponte o rosto para a câmera — a entrada/saída é registrada automaticamente</p>
+
+  <div class="card">
+    <video id="webcam" autoplay playsinline muted></video>
+    <canvas id="canvas" style="display:none;"></canvas>
+  </div>
+
+  <div class="card">
+    <div class="section-title">Registrar ponto</div>
+    <button class="btn-verify" id="btn-verify" style="width:100%;">Capturar e identificar</button>
+    <div class="status" id="result"></div>
+  </div>
+
+  <div class="card">
+    <div class="section-title">Pessoas no banco</div>
+    <ul id="face-list"></ul>
+    <div class="buttons">
+      <button class="btn-ghost" id="btn-reload">Recarregar rostos do banco</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="section-title">Últimos registros de ponto</div>
+    <ul id="access-list"></ul>
+  </div>
+</div>
+
+<script>
+const API_BASE = window.location.origin;
+
+const video = document.getElementById('webcam');
+const canvas = document.getElementById('canvas');
+const btnVerify = document.getElementById('btn-verify');
+const btnReload = document.getElementById('btn-reload');
+const resultBox = document.getElementById('result');
+const faceList = document.getElementById('face-list');
+const accessList = document.getElementById('access-list');
+
+// 1) Liga a webcam
+async function startCamera() {
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 }, audio: false });
+    video.srcObject = stream;
+  } catch (err) {
+    showResult('error', 'Não foi possível acessar a câmera: ' + err.message);
+  }
+}
+
+// 2) Captura o frame atual do vídeo como um Blob (imagem jpeg)
+function captureBlob() {
+  return new Promise((resolve) => {
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    const ctx = canvas.getContext('2d');
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+    canvas.toBlob((blob) => resolve(blob), 'image/jpeg', 0.92);
+  });
+}
+
+function showResult(type, message, sub) {
+  resultBox.className = 'status show ' + type;
+  resultBox.innerHTML = message + (sub ? `<span class="sim">${sub}</span>` : '');
+}
+
+function setLoading(isLoading) {
+  btnVerify.disabled = isLoading;
+  btnReload.disabled = isLoading;
+}
+
+// 3) Reconhecimento + registro automático de ponto
+btnVerify.addEventListener('click', async () => {
+  setLoading(true);
+  showResult('info', 'Capturando e identificando...');
+
+  try {
+    const blob = await captureBlob();
+    const form = new FormData();
+    form.append('file', blob, 'capture.jpg');
+
+    const resp = await fetch(`${API_BASE}/faces/recognize`, { method: 'POST', body: form });
+    const data = await resp.json();
+
+    if (!resp.ok) {
+      showResult('error', '⚠️ ' + (data.detail || 'Erro ao identificar.'));
+      return;
+    }
+
+    if (data.faces_found === 0) {
+      showResult('error', '🚫 Nenhum rosto detectado. Aproxime-se da câmera.');
+      return;
+    }
+
+    const face = data.results[0];
+
+    if (face.reconhecido) {
+      let pontoMsg = '';
+      if (face.access) {
+        const emoji = face.access.tipo === 'entrada' ? '🟢' : '🔴';
+        const label = face.access.tipo === 'entrada' ? 'Entrada' : 'Saída';
+        pontoMsg = face.access.skipped
+          ? ` <br>${emoji} ${label} já registrada há pouco.`
+          : ` <br>${emoji} ${label} registrada automaticamente!`;
+      }
+      showResult(
+        'success',
+        `✅ <strong>${face.nome}</strong>${pontoMsg}`,
+        `CPF: ${face.cpf} — similaridade: ${face.similarity}`
+      );
+      loadAccessLogs();
+    } else {
+      showResult(
+        'error',
+        '❌ Pessoa não reconhecida',
+        `melhor similaridade encontrada: ${face.similarity}`
+      );
+    }
+  } catch (err) {
+    showResult('error', 'Erro de conexão com a API: ' + err.message);
+  } finally {
+    setLoading(false);
+  }
+});
+
+// 4) Lista as pessoas que vêm da tabela `pessoa` (foto servida pela API)
+async function loadFaces() {
+  try {
+    const resp = await fetch(`${API_BASE}/pessoas`);
+    const data = await resp.json();
+
+    faceList.innerHTML = '';
+    if (data.length === 0) {
+      faceList.innerHTML = '<li class="empty">Nenhuma pessoa no banco. O cadastro é feito pela outra API.</li>';
+      return;
+    }
+
+    data.forEach((pessoa) => {
+      const li = document.createElement('li');
+      li.innerHTML = `
+        <img src="${API_BASE}${pessoa.foto_url}" alt="" onerror="this.style.visibility='hidden'" />
+        <span>${pessoa.nome}<span class="cpf">${pessoa.cpf}</span></span>`;
+      faceList.appendChild(li);
+    });
+  } catch (err) {
+    faceList.innerHTML = '<li class="empty">Erro ao carregar lista.</li>';
+  }
+}
+
+// 5) Força a API a reler as fotos do banco e recalcular os embeddings
+btnReload.addEventListener('click', async () => {
+  setLoading(true);
+  showResult('info', 'Recarregando rostos do banco...');
+  try {
+    const resp = await fetch(`${API_BASE}/faces/reload`, { method: 'POST' });
+    const data = await resp.json();
+    showResult(
+      'success',
+      `🔄 ${data.embeddings_em_cache} rosto(s) carregado(s) do banco.`,
+      data.fotos_com_problema ? `fotos com problema: ${data.fotos_com_problema}` : ''
+    );
+    loadFaces();
+  } catch (err) {
+    showResult('error', 'Erro ao recarregar: ' + err.message);
+  } finally {
+    setLoading(false);
+  }
+});
+
+// 6) Últimos registros de ponto
+async function loadAccessLogs() {
+  try {
+    const resp = await fetch(`${API_BASE}/access/logs?limit=20`);
+    const data = await resp.json();
+
+    accessList.innerHTML = '';
+    if (data.length === 0) {
+      accessList.innerHTML = '<li class="empty">Nenhum registro de ponto ainda.</li>';
+      return;
+    }
+
+    data.forEach((log) => {
+      const li = document.createElement('li');
+      const when = new Date(log.data_hora).toLocaleString('pt-BR');
+      const emoji = log.tipo === 'entrada' ? '🟢' : '🔴';
+      li.innerHTML = `<span>${emoji} ${log.nome || log.cpf} — ${log.tipo}</span><span class="sim" style="margin:0;">${when}</span>`;
+      accessList.appendChild(li);
+    });
+  } catch (err) {
+    accessList.innerHTML = '<li class="empty">Erro ao carregar registros.</li>';
+  }
+}
+
+startCamera();
+loadFaces();
+loadAccessLogs();
+</script>
+</body>
+</html>
