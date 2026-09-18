@@ -1,0 +1,11 @@
+fastapi
+uvicorn[standard]
+python-multipart
+insightface
+onnxruntime
+opencv-python-headless
+numpy
+pillow
+psycopg2-binary
+python-dotenv
+requests  # usado apenas pelo test_client.py

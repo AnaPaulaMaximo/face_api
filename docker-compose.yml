@@ -1,0 +1,16 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: face_api_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: face_api
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5433:5432"
+    volumes:
+      - face_api_pgdata:/var/lib/postgresql/data
+
+volumes:
+  face_api_pgdata:
