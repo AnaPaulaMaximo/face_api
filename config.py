@@ -1,10 +1,14 @@
 """
 config.py
+
 Configurações da aplicação lidas de variáveis de ambiente (.env).
 
 Nesta versão a API NÃO cadastra ninguém: as pessoas (e suas fotos em base64)
 vêm da tabela `pessoa`, alimentada por outra API. Aqui só gravamos os logs
 de entrada/saída.
+
+O banco é o Cloudflare D1 (SQLite serverless), acessado pela API REST da
+Cloudflare.
 """
 
 import os
@@ -14,16 +18,14 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# --- PostgreSQL ---
-# Você pode configurar via DATABASE_URL (ex: postgresql://user:senha@host:5432/face_api)
-# ou via variáveis separadas (PGHOST, PGPORT, PGDATABASE, PGUSER, PGPASSWORD).
-DATABASE_URL = os.getenv("DATABASE_URL")
+# --- Cloudflare D1 ---
+# Account ID, Database ID (UUID) e API Token com permissão "D1 Edit".
+CLOUDFLARE_ACCOUNT_ID = os.getenv("CLOUDFLARE_ACCOUNT_ID", "")
+CLOUDFLARE_D1_DATABASE_ID = os.getenv("CLOUDFLARE_D1_DATABASE_ID", "")
+CLOUDFLARE_API_TOKEN = os.getenv("CLOUDFLARE_API_TOKEN", "")
 
-PGHOST = os.getenv("PGHOST", "localhost")
-PGPORT = os.getenv("PGPORT", "5432")
-PGDATABASE = os.getenv("PGDATABASE", "face_api")
-PGUSER = os.getenv("PGUSER", "postgres")
-PGPASSWORD = os.getenv("PGPASSWORD", "postgres")
+# Timeout (segundos) de cada chamada HTTP ao D1.
+D1_TIMEOUT_SECONDS = float(os.getenv("D1_TIMEOUT_SECONDS", "15"))
 
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -57,11 +59,11 @@ SIMILARITY_THRESHOLD = float(os.getenv("SIMILARITY_THRESHOLD", "0.40"))
 FACE_CACHE_TTL_SECONDS = int(os.getenv("FACE_CACHE_TTL_SECONDS", "60"))
 
 
-def get_dsn() -> str:
-    """Retorna a string de conexão (DSN) do PostgreSQL."""
-    if DATABASE_URL:
-        return DATABASE_URL
-    return (
-        f"host={PGHOST} port={PGPORT} dbname={PGDATABASE} "
-        f"user={PGUSER} password={PGPASSWORD}"
-    )
+def missing_d1_settings() -> list:
+    """Nomes das variáveis do Cloudflare D1 que ainda não foram preenchidas."""
+    required = {
+        "CLOUDFLARE_ACCOUNT_ID": CLOUDFLARE_ACCOUNT_ID,
+        "CLOUDFLARE_D1_DATABASE_ID": CLOUDFLARE_D1_DATABASE_ID,
+        "CLOUDFLARE_API_TOKEN": CLOUDFLARE_API_TOKEN,
+    }
+    return [name for name, value in required.items() if not value]
