@@ -1,7 +1,7 @@
 # Face API — reconhecimento facial + registro de ponto
 
 API REST em FastAPI que reconhece rostos com InsightFace (RetinaFace + ArcFace)
-e grava **apenas os logs de entrada/saída** no PostgreSQL.
+e grava **apenas os logs de entrada/saída** no **Cloudflare D1**.
 
 O **cadastro não é feito aqui**. Outra API cadastra as pessoas na tabela
 `pessoa`, salvando a foto como **string base64**. Esta API lê essas fotos,
@@ -16,18 +16,20 @@ gera os embeddings faciais e usa isso para reconhecer quem está na câmera.
 
 ## Estrutura do banco
 
+O D1 é SQLite serverless da Cloudflare. A API fala com ele pela API REST.
+
 ```sql
 CREATE TABLE pessoa (          -- mantida pela OUTRA API (aqui é só leitura)
-    cpf  VARCHAR(14) PRIMARY KEY,
+    cpf  TEXT PRIMARY KEY,
     nome TEXT NOT NULL,
     foto TEXT                  -- imagem em base64 (aceita "data:image/jpeg;base64,...")
 );
 
 CREATE TABLE logs (            -- escrita por esta API
-    id         SERIAL PRIMARY KEY,
-    pessoa_cpf VARCHAR(14) NOT NULL REFERENCES pessoa(cpf) ON DELETE CASCADE,
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    pessoa_cpf TEXT NOT NULL REFERENCES pessoa(cpf) ON DELETE CASCADE,
     tipo       TEXT NOT NULL CHECK (tipo IN ('entrada','saida')),
-    data_hora  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    data_hora  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))  -- ISO 8601 UTC
 );
 ```
 
@@ -35,15 +37,44 @@ Se os nomes das colunas na sua base forem outros, não precisa mexer no código:
 ajuste `PESSOA_TABLE`, `PESSOA_PK`, `PESSOA_NOME_COL`, `PESSOA_FOTO_COL`,
 `LOGS_TABLE`, `LOGS_FK_COL` e `LOGS_DATETIME_COL` no `.env`.
 
+## Configurando o Cloudflare D1
+
+1. Crie o banco (precisa de Node.js):
+
+```bash
+   npx wrangler login
+   npx wrangler d1 create face_api       # mostra o database_id (UUID)
+   npx wrangler whoami                   # mostra o Account ID
+```
+
+   Pelo painel: **Storage & Databases → D1 SQL Database → Create**.
+
+2. Crie um API Token em **My Profile → API Tokens → Create Token → Custom token**
+   com a permissão **Account → D1 → Edit**.
+
+3. Preencha o `.env` (veja `.env.example`):
+
+```env
+   CLOUDFLARE_ACCOUNT_ID=...
+   CLOUDFLARE_D1_DATABASE_ID=...
+   CLOUDFLARE_API_TOKEN=...
+```
+
+> A tabela `pessoa` precisa estar no **mesmo** banco D1 em que esta API grava os
+> logs. Se a API de cadastro ainda usa outro banco, ela também precisa apontar
+> para o D1.
+
 ## Como rodar
 
 ```bash
-cp .env.example .env          # ajuste host/porta/senha do Postgres
-docker compose up -d          # sobe um Postgres na porta 5433 (opcional)
+cp .env.example .env          # preencha as credenciais do Cloudflare D1
 
 pip install -r requirements.txt
 uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 ```
+
+Na subida a API testa a conexão com o D1 e, com `AUTO_CREATE_TABLES=true`,
+cria as tabelas que não existirem. Em produção use `AUTO_CREATE_TABLES=false`.
 
 Abra `http://localhost:8000` para a tela com câmera.
 Documentação automática em `http://localhost:8000/docs`.
@@ -124,7 +155,8 @@ python test_client.py
 | `main.py` | endpoints FastAPI |
 | `face_engine.py` | InsightFace + decodificação do base64 + similaridade |
 | `face_store.py` | cache em memória dos embeddings vindos da tabela `pessoa` |
-| `database.py` | acesso ao PostgreSQL (lê `pessoa`, escreve `logs`) |
+| `database.py` | acesso ao Cloudflare D1 via API REST (lê `pessoa`, escreve `logs`) |
 | `config.py` | configurações via `.env` |
+| `.env.example` | modelo das variáveis de ambiente |
 | `static/index.html` | tela com câmera (reconhecer + ver pessoas e logs) |
 | `seed_pessoa.py` | utilitário de teste para popular a tabela `pessoa` |
