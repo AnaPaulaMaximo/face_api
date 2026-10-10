@@ -30,9 +30,9 @@ import logging
 from datetime import date, datetime, timezone
 from typing import List, Literal, Optional
 
-from fastapi import FastAPI, File, HTTPException, Query, Response, UploadFile
+from fastapi import FastAPI, File, HTTPException, Query, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -60,6 +60,12 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.exception_handler(fe.InvalidImageError)
+async def invalid_image_handler(request: Request, exc: fe.InvalidImageError):
+    """Arquivo que não é imagem -> 422 em vez de 500."""
+    return JSONResponse(status_code=422, content={"detail": str(exc)})
 
 
 @app.on_event("startup")

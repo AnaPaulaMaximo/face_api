@@ -84,9 +84,16 @@ def _sniff_mime(image_bytes: bytes) -> str:
     return "image/jpeg"
 
 
+class InvalidImageError(ValueError):
+    """Arquivo enviado não é uma imagem válida."""
+
+
 def bytes_to_bgr_image(image_bytes: bytes) -> np.ndarray:
     """Converte bytes de imagem (jpg/png/etc) em array BGR (formato OpenCV)."""
-    img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    try:
+        img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    except Exception as exc:
+        raise InvalidImageError("O arquivo enviado não é uma imagem válida.") from exc
     arr = np.array(img)  # RGB
     return arr[:, :, ::-1].copy()  # -> BGR
 
