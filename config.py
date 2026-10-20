@@ -3,31 +3,29 @@ config.py
 
 Configurações da aplicação lidas de variáveis de ambiente (.env).
 
-Nesta versão a API NÃO cadastra ninguém: as pessoas (e suas fotos em base64)
-vêm da tabela `pessoa`, alimentada por outra API. Aqui só gravamos os logs
-de entrada/saída.
-
-O banco é o Cloudflare D1 (SQLite serverless), acessado pela API REST da
-Cloudflare.
+Esta API não cadastra ninguém: as pessoas (e suas fotos em base64) vêm da
+tabela `pessoa`, alimentada por outra API. Aqui só gravamos os logs de
+entrada/saída no Cloudflare D1 (SQLite serverless, via API REST).
 """
 
 import os
-from pathlib import Path
 
 from dotenv import load_dotenv
 
 load_dotenv()
 
+
+def _env_bool(name: str, default: str) -> bool:
+    return os.getenv(name, default).lower() in ("1", "true", "yes")
+
+
 # --- Cloudflare D1 ---
-# Account ID, Database ID (UUID) e API Token com permissão "D1 Edit".
 CLOUDFLARE_ACCOUNT_ID = os.getenv("CLOUDFLARE_ACCOUNT_ID", "")
 CLOUDFLARE_D1_DATABASE_ID = os.getenv("CLOUDFLARE_D1_DATABASE_ID", "")
 CLOUDFLARE_API_TOKEN = os.getenv("CLOUDFLARE_API_TOKEN", "")
 
 # Timeout (segundos) de cada chamada HTTP ao D1.
 D1_TIMEOUT_SECONDS = float(os.getenv("D1_TIMEOUT_SECONDS", "15"))
-
-BASE_DIR = Path(__file__).resolve().parent
 
 # --- Nomes de tabela/coluna ---
 # A tabela `pessoa` pertence à outra API. Se lá os nomes forem diferentes,
@@ -43,20 +41,33 @@ LOGS_DATETIME_COL = os.getenv("LOGS_DATETIME_COL", "data_hora")
 
 # Se True, a API cria as tabelas caso não existam (útil em dev).
 # Em produção, deixe False: quem manda no schema é a API de cadastro.
-AUTO_CREATE_TABLES = os.getenv("AUTO_CREATE_TABLES", "true").lower() in ("1", "true", "yes")
+AUTO_CREATE_TABLES = _env_bool("AUTO_CREATE_TABLES", "true")
 
+# --- Regras de acesso ---
 # Tempo mínimo (segundos) entre dois registros de ponto da MESMA pessoa.
 # Evita contar entrada/saída duplicada se a câmera mandar vários frames seguidos.
-ACCESS_COOLDOWN_SECONDS = int(os.getenv("ACCESS_COOLDOWN_SECONDS", "4"))
+ACCESS_COOLDOWN_SECONDS = float(os.getenv("ACCESS_COOLDOWN_SECONDS", "4"))
 
 # Limiar de similaridade de cosseno para considerar "é a mesma pessoa".
 # Com ArcFace (buffalo_l), 0.35–0.45 costuma ser um bom ponto de corte.
 SIMILARITY_THRESHOLD = float(os.getenv("SIMILARITY_THRESHOLD", "0.40"))
 
-# De quanto em quanto tempo (segundos) a API relê a tabela `pessoa` para
-# descobrir gente nova cadastrada pela outra API. Só recalcula o embedding
-# de quem é novo ou teve a foto alterada.
-FACE_CACHE_TTL_SECONDS = int(os.getenv("FACE_CACHE_TTL_SECONDS", "60"))
+# De quanto em quanto tempo (segundos) a thread de fundo relê a tabela
+# `pessoa` para descobrir gente nova ou foto trocada.
+FACE_CACHE_TTL_SECONDS = float(os.getenv("FACE_CACHE_TTL_SECONDS", "60"))
+
+# --- Motor facial ---
+# Pacote de modelos do InsightFace. `buffalo_l` é o mais preciso (ArcFace
+# ResNet-50). `buffalo_s` é bem mais leve, mas o limiar precisa ser recalibrado.
+FACE_MODEL = os.getenv("FACE_MODEL", "buffalo_l")
+
+# Resolução (lado, em px) em que o detector trabalha. Numa catraca o rosto
+# fica perto da câmera, então 320 basta e é ~4x mais rápido que 640.
+# Suba para 480/640 se a câmera ficar longe e rostos pequenos não forem achados.
+FACE_DET_SIZE = int(os.getenv("FACE_DET_SIZE", "320"))
+
+# Tamanho máximo (bytes) da imagem aceita em POST /faces/recognize.
+MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(10 * 1024 * 1024)))
 
 
 def missing_d1_settings() -> list:

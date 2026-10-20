@@ -3,8 +3,6 @@ database.py
 
 Acesso ao Cloudflare D1 (SQLite serverless) pela API REST da Cloudflare.
 
-Duas tabelas:
-
 pessoa (mantida por OUTRA API — aqui é só leitura)
     cpf   PK
     nome
@@ -16,18 +14,21 @@ logs (escrita por esta API)
     tipo        'entrada' | 'saida'
     data_hora   TEXT em ISO 8601 UTC (ex: 2026-01-20T13:05:11.204Z)
 
-O D1 não tem tipo de data/hora nativo, então `data_hora` é guardado como texto
-ISO 8601 em UTC e convertido para `datetime` (com timezone) ao ler, mantendo
-o mesmo contrato que o resto da aplicação já esperava.
+Cada chamada ao D1 custa ~200-300 ms de rede, então as consultas foram
+desenhadas para o caminho quente (reconhecer + registrar) não depender delas:
+o cache de rostos é atualizado por uma thread de fundo (`face_store.py`) e o
+último log de cada pessoa fica em memória (`access.py`).
 """
 
 import logging
 import re
 import threading
 from datetime import date, datetime, timezone
-from typing import Any, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 import config
 
@@ -35,6 +36,9 @@ logger = logging.getLogger("database")
 
 _API_BASE = "https://api.cloudflare.com/client/v4"
 _IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+# O D1 aceita no máximo 100 parâmetros por query.
+_D1_MAX_PARAMS = 100
 
 _SESSION: Optional[requests.Session] = None
 _SESSION_LOCK = threading.Lock()
@@ -45,16 +49,12 @@ class D1Error(RuntimeError):
 
 
 def _ident(name: str) -> str:
-    """
-    Valida e protege um identificador (tabela/coluna) vindo do config.
-    Só aceita letras, números e underscore, para nunca virar SQL injection.
-    """
+    """Valida um identificador (tabela/coluna) vindo do config: só letras, números e `_`."""
     if not _IDENT_RE.match(name):
         raise ValueError(f"Identificador SQL inválido: {name!r}")
     return f'"{name}"'
 
 
-# Identificadores usados nas queries (vêm do config).
 _PESSOA = _ident(config.PESSOA_TABLE)
 _CPF = _ident(config.PESSOA_PK)
 _NOME = _ident(config.PESSOA_NOME_COL)
@@ -79,20 +79,24 @@ def _get_session() -> requests.Session:
                     "Content-Type": "application/json",
                 }
             )
+            # Conexão keep-alive + retry curto para instabilidade momentânea do D1.
+            retry = Retry(
+                total=2,
+                backoff_factor=0.3,
+                status_forcelist=(502, 503, 504),
+                allowed_methods=frozenset({"POST"}),
+            )
+            session.mount("https://", HTTPAdapter(max_retries=retry, pool_maxsize=4))
             _SESSION = session
         return _SESSION
 
 
 def _query(sql: str, params: Optional[list] = None) -> List[dict]:
-    """
-    Executa UMA instrução SQL no D1 e devolve as linhas como lista de dicts.
-    Os parâmetros (`?`) são enviados separados do SQL, nunca concatenados.
-    """
+    """Executa UMA instrução SQL no D1 e devolve as linhas como lista de dicts."""
     missing = config.missing_d1_settings()
     if missing:
         raise D1Error(
-            "Configuração do Cloudflare D1 incompleta. Defina no .env: "
-            + ", ".join(missing)
+            "Configuração do Cloudflare D1 incompleta. Defina no .env: " + ", ".join(missing)
         )
 
     url = (
@@ -136,10 +140,21 @@ def _parse_dt(value: Any) -> Optional[datetime]:
     return dt
 
 
+def format_dt(dt: datetime) -> str:
+    """Formata no mesmo padrão do DEFAULT da coluna (ISO 8601 UTC, milissegundos, sufixo Z)."""
+    dt = dt.astimezone(timezone.utc)
+    return dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{dt.microsecond // 1000:03d}Z"
+
+
 def _fix_log_row(row: dict) -> dict:
     row = dict(row)
     row["data_hora"] = _parse_dt(row.get("data_hora"))
     return row
+
+
+def _chunks(items: List[Any], size: int) -> Iterable[List[Any]]:
+    for i in range(0, len(items), size):
+        yield items[i : i + size]
 
 
 # ---------------------------------------------------------------------------
@@ -186,48 +201,59 @@ def init_db():
 # Pessoas (somente leitura — o cadastro é feito por outra API)
 # ---------------------------------------------------------------------------
 
-def list_pessoas() -> List[dict]:
-    """Lista cpf e nome de todas as pessoas (sem trazer a foto, que é pesada)."""
-    return _query(
-        f"SELECT {_CPF} AS cpf, {_NOME} AS nome FROM {_PESSOA} ORDER BY {_NOME}"
-    )
-
-
-def list_pessoas_com_foto() -> List[dict]:
-    """Lista cpf, nome e foto (base64) de todas as pessoas que têm foto."""
-    return _query(
+def list_pessoas_assinaturas() -> List[dict]:
+    """
+    Lista cpf, nome e uma "assinatura" barata da foto (tamanho + início + fim
+    do base64) de todas as pessoas com foto. Serve para descobrir quem é novo
+    ou trocou de foto SEM baixar os base64 inteiros a cada atualização.
+    """
+    rows = _query(
         f"""
-        SELECT {_CPF} AS cpf, {_NOME} AS nome, {_FOTO} AS foto
+        SELECT {_CPF} AS cpf, {_NOME} AS nome,
+               length({_FOTO}) AS tam,
+               substr({_FOTO}, 1, 64) AS ini,
+               substr({_FOTO}, -64) AS fim
         FROM {_PESSOA}
         WHERE {_FOTO} IS NOT NULL AND {_FOTO} <> ''
         """
     )
+    return [
+        {
+            "cpf": str(r["cpf"]),
+            "nome": r["nome"],
+            "assinatura": f"{r['tam']}:{r['ini']}:{r['fim']}",
+        }
+        for r in rows
+    ]
 
 
-def get_pessoa(cpf: str) -> Optional[dict]:
-    rows = _query(
-        f"""
-        SELECT {_CPF} AS cpf, {_NOME} AS nome, {_FOTO} AS foto
-        FROM {_PESSOA} WHERE {_CPF} = ?
-        """,
-        [cpf],
-    )
-    return rows[0] if rows else None
+def get_fotos(cpfs: List[str]) -> Dict[str, str]:
+    """Devolve {cpf: foto_base64} só das pessoas pedidas (em lotes, pelo limite de parâmetros do D1)."""
+    fotos: Dict[str, str] = {}
+    for lote in _chunks(list(cpfs), _D1_MAX_PARAMS):
+        marcadores = ", ".join("?" * len(lote))
+        rows = _query(
+            f"SELECT {_CPF} AS cpf, {_FOTO} AS foto FROM {_PESSOA} WHERE {_CPF} IN ({marcadores})",
+            lote,
+        )
+        for r in rows:
+            fotos[str(r["cpf"])] = r["foto"]
+    return fotos
 
 
 # ---------------------------------------------------------------------------
 # Logs de entrada / saída
 # ---------------------------------------------------------------------------
 
-def add_log(cpf: str, tipo: str) -> dict:
-    """Insere um registro de entrada/saída e devolve a linha criada."""
+def add_log(cpf: str, tipo: str, data_hora: datetime) -> dict:
+    """Insere um registro de entrada/saída (com a data/hora decidida pela API) e devolve a linha."""
     rows = _query(
         f"""
-        INSERT INTO {_LOGS} ({_FK}, tipo)
-        VALUES (?, ?)
+        INSERT INTO {_LOGS} ({_FK}, tipo, {_DT})
+        VALUES (?, ?, ?)
         RETURNING id, {_FK} AS cpf, tipo, {_DT} AS data_hora
         """,
-        [cpf, tipo],
+        [cpf, tipo, format_dt(data_hora)],
     )
     return _fix_log_row(rows[0])
 
@@ -245,6 +271,20 @@ def get_last_log(cpf: str) -> Optional[dict]:
         [cpf],
     )
     return _fix_log_row(rows[0]) if rows else None
+
+
+def get_last_logs() -> Dict[str, dict]:
+    """Último registro de CADA pessoa, numa única query: {cpf: {tipo, data_hora}}."""
+    rows = _query(
+        f"""
+        SELECT cpf, tipo, data_hora FROM (
+            SELECT {_FK} AS cpf, tipo, {_DT} AS data_hora,
+                   ROW_NUMBER() OVER (PARTITION BY {_FK} ORDER BY {_DT} DESC, id DESC) AS rn
+            FROM {_LOGS}
+        ) WHERE rn = 1
+        """
+    )
+    return {str(r["cpf"]): _fix_log_row(r) for r in rows}
 
 
 def list_logs(
