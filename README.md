@@ -76,8 +76,7 @@ uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 Na subida a API testa a conexão com o D1 e, com `AUTO_CREATE_TABLES=true`,
 cria as tabelas que não existirem. Em produção use `AUTO_CREATE_TABLES=false`.
 
-Abra `http://localhost:8000` para a tela com câmera.
-Documentação automática em `http://localhost:8000/docs`.
+Abra `http://localhost:8000` (redireciona para a documentação interativa em `/docs`).
 
 Na primeira execução o InsightFace baixa o modelo `buffalo_l` (~300 MB).
 
@@ -158,5 +157,4 @@ python test_client.py
 | `database.py` | acesso ao Cloudflare D1 via API REST (lê `pessoa`, escreve `logs`) |
 | `config.py` | configurações via `.env` |
 | `.env.example` | modelo das variáveis de ambiente |
-| `static/index.html` | tela com câmera (reconhecer + ver pessoas e logs) |
 | `seed_pessoa.py` | utilitário de teste para popular a tabela `pessoa` |
