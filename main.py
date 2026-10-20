@@ -63,7 +63,7 @@ app = FastAPI(
         "As pessoas e suas fotos (base64) vêm da tabela `pessoa`, alimentada por "
         "outra API. Aqui só são gravados os logs de entrada/saída."
     ),
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
