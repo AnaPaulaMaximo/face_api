@@ -1,4 +1,6 @@
 """
+python -m uvicorn main:app --port 8000   
+
 main.py
 API REST de reconhecimento facial com FastAPI + InsightFace (ArcFace/RetinaFace).
 
@@ -32,8 +34,7 @@ from typing import List, Literal, Optional
 
 from fastapi import FastAPI, File, HTTPException, Query, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles
+from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import BaseModel
 
 import config
@@ -134,7 +135,7 @@ def _registrar_ponto(cpf: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Básico / frontend
+# Básico
 # ---------------------------------------------------------------------------
 
 @app.get("/health")
@@ -142,14 +143,10 @@ def health():
     return {"status": "ok"}
 
 
-@app.get("/")
-def serve_frontend():
-    """Serve a página web simples de reconhecimento via câmera."""
-    return FileResponse("static/index.html")
-
-
-app.mount("/static", StaticFiles(directory="static"), name="static")
-
+@app.get("/", include_in_schema=False)
+def root():
+    """A API não serve mais frontend: a raiz redireciona para a documentação."""
+    return RedirectResponse(url="/docs")
 
 # ---------------------------------------------------------------------------
 # Pessoas (leitura do banco — cadastro é feito por outra API)
