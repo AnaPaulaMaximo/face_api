@@ -158,3 +158,33 @@ python test_client.py
 | `config.py` | configurações via `.env` |
 | `.env.example` | modelo das variáveis de ambiente |
 | `seed_pessoa.py` | utilitário de teste para popular a tabela `pessoa` |
+## Fluxo de branches (Git Flow)
+
+| Branch | Papel |
+|---|---|
+| `main` | código em produção; só recebe merge de `release/*` e `hotfix/*`, sempre com tag de versão |
+| `develop` | integração do que vai entrar na próxima versão; base de toda `feature/*` |
+| `feature/<nome>` | sai de `develop`, volta para `develop` via pull request |
+| `release/<versão>` | sai de `develop`; só correções e bump de versão; fecha em `main` (com tag `v<versão>`) e em `develop` |
+| `hotfix/<versão>` | sai de `main` para corrigir produção; fecha em `main` (com tag) e em `develop` |
+
+Comandos do dia a dia:
+
+```bash
+# nova funcionalidade
+git checkout develop && git pull
+git checkout -b feature/minha-feature
+# ... commits ...
+git push -u origin feature/minha-feature   # abrir PR para develop
+
+# nova versão
+git checkout develop && git pull
+git checkout -b release/1.1.0
+# ajustar version= em main.py, corrigir o que faltar
+git checkout main && git merge --no-ff release/1.1.0
+git tag -a v1.1.0 -m "Release 1.1.0"
+git checkout develop && git merge --no-ff release/1.1.0
+git push origin main develop release/1.1.0 --tags
+```
+
+A versão da API (`version=` em `main.py`) deve acompanhar a tag da release.
