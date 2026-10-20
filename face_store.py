@@ -1,21 +1,25 @@
 """
 face_store.py
+
 Cache em memória dos embeddings faciais das pessoas cadastradas.
 
-Como o cadastro é feito por OUTRA API (que grava a foto em base64 na tabela
-`pessoa`), esta API precisa converter essas fotos em embeddings para poder
-reconhecer alguém. Calcular embedding é caro, então:
+O cadastro é feito por OUTRA API (que grava a foto em base64 na tabela
+`pessoa`). Esta API converte essas fotos em embeddings uma única vez e guarda
+tudo numa matriz NumPy (N x 512): identificar alguém vira uma multiplicação
+matriz-vetor, em microssegundos, independente do tamanho do cadastro.
 
-  - o resultado fica em memória, indexado por CPF;
-  - a tabela `pessoa` é relida a cada FACE_CACHE_TTL_SECONDS;
-  - só recalcula o embedding de quem é novo ou trocou de foto (comparação
-    por hash da string base64);
+Como a atualização funciona (sem pesar nas requisições):
+
+  - uma thread de fundo relê a tabela `pessoa` a cada FACE_CACHE_TTL_SECONDS;
+  - a releitura pede ao banco só uma "assinatura" barata de cada foto
+    (tamanho + início + fim do base64), não o base64 inteiro;
+  - o base64 só é baixado, e o embedding só é recalculado, para quem é novo
+    ou cuja assinatura mudou;
   - quem some da tabela some do cache.
 
-Também é possível forçar a releitura chamando POST /faces/reload.
+POST /faces/reload força uma releitura completa (recalcula todo mundo).
 """
 
-import hashlib
 import logging
 import threading
 import time
@@ -29,135 +33,156 @@ import face_engine as fe
 
 logger = logging.getLogger("face_store")
 
-_lock = threading.RLock()
-_cache: Dict[str, dict] = {}        # cpf -> {nome, foto_hash, embedding}
-_invalidas: Dict[str, str] = {}     # cpf -> motivo de não ter virado embedding
+_EMB_DIM = 512
+
+_refresh_lock = threading.Lock()   # só um refresh por vez
+_meta: Dict[str, dict] = {}        # cpf -> {nome, assinatura, embedding}
+_invalidas: Dict[str, str] = {}    # cpf -> motivo de não ter virado embedding
 _last_refresh: float = 0.0
 
+# Snapshot imutável consultado pelo reconhecimento. Trocado atomicamente
+# (atribuição de referência é atômica no CPython), então identify() não
+# precisa de lock.
+_cpfs: List[str] = []
+_nomes: List[str] = []
+_matrix: np.ndarray = np.zeros((0, _EMB_DIM), dtype=np.float32)
 
-def _hash(texto: str) -> str:
-    return hashlib.sha256(texto.encode("utf-8", errors="ignore")).hexdigest()
+_stop = threading.Event()
+_thread: Optional[threading.Thread] = None
 
 
 def refresh(force: bool = False) -> dict:
     """
-    Relê a tabela `pessoa` e atualiza o cache de embeddings.
-    Com force=True, recalcula o embedding de todo mundo.
-    Retorna um resumo do que aconteceu.
+    Sincroniza o cache com a tabela `pessoa`. Com force=True recalcula o
+    embedding de todo mundo. Retorna um resumo do que aconteceu.
     """
-    global _last_refresh
+    global _last_refresh, _cpfs, _nomes, _matrix
 
-    with _lock:
+    with _refresh_lock:
         inicio = time.time()
-        pessoas = db.list_pessoas_com_foto()
+        pessoas = db.list_pessoas_assinaturas()
 
-        novo_cache: Dict[str, dict] = {}
+        novo_meta: Dict[str, dict] = {}
         novas_invalidas: Dict[str, str] = {}
-        criados = reaproveitados = falhas = 0
+        pendentes: Dict[str, dict] = {}
+        reaproveitados = 0
 
-        for pessoa in pessoas:
-            cpf = str(pessoa["cpf"])
-            nome = pessoa["nome"]
-            foto = pessoa["foto"]
-            foto_hash = _hash(foto)
+        for p in pessoas:
+            cpf = p["cpf"]
+            antigo = _meta.get(cpf)
+            if not force and antigo is not None and antigo["assinatura"] == p["assinatura"]:
+                # mesma foto de antes: reaproveita (o nome pode ter mudado)
+                novo_meta[cpf] = {**antigo, "nome": p["nome"]}
+                if antigo["embedding"] is None:
+                    novas_invalidas[cpf] = _invalidas.get(cpf, "Foto inválida.")
+                else:
+                    reaproveitados += 1
+            else:
+                pendentes[cpf] = p
 
-            antigo = _cache.get(cpf)
-            if not force and antigo is not None and antigo["foto_hash"] == foto_hash:
-                antigo["nome"] = nome  # o nome pode ter mudado
-                novo_cache[cpf] = antigo
-                reaproveitados += 1
-                continue
-
+        fotos = db.get_fotos(list(pendentes)) if pendentes else {}
+        criados = 0
+        for cpf, p in pendentes.items():
+            motivo = None
             try:
-                embedding = fe.embedding_from_base64(foto)
-            except ValueError as exc:
-                novas_invalidas[cpf] = str(exc)
-                falhas += 1
-                logger.warning("Foto inválida para o CPF %s: %s", cpf, exc)
-                continue
-            except Exception as exc:  # imagem corrompida, formato não suportado...
-                novas_invalidas[cpf] = f"Erro ao ler a imagem: {exc}"
-                falhas += 1
-                logger.warning("Erro ao processar a foto do CPF %s: %s", cpf, exc)
+                embedding = fe.embedding_from_base64(fotos.get(cpf, ""))
+                if embedding is None:
+                    motivo = "Nenhum rosto detectado na foto cadastrada."
+            except ValueError as exc:  # base64 inválido ou imagem indecodificável
+                motivo = str(exc)
+            except Exception as exc:  # qualquer outra falha do modelo
+                motivo = f"Erro ao processar a foto: {exc}"
+
+            if motivo:
+                # guarda a assinatura mesmo assim, para não baixar a mesma foto ruim a cada ciclo
+                novas_invalidas[cpf] = motivo
+                novo_meta[cpf] = {"nome": p["nome"], "assinatura": p["assinatura"], "embedding": None}
+                logger.warning("Foto do CPF %s ignorada: %s", cpf, motivo)
                 continue
 
-            if embedding is None:
-                novas_invalidas[cpf] = "Nenhum rosto detectado na foto cadastrada."
-                falhas += 1
-                logger.warning("Nenhum rosto detectado na foto do CPF %s.", cpf)
-                continue
-
-            novo_cache[cpf] = {
-                "cpf": cpf,
-                "nome": nome,
-                "foto_hash": foto_hash,
-                "embedding": embedding,
-            }
+            novo_meta[cpf] = {"nome": p["nome"], "assinatura": p["assinatura"], "embedding": embedding}
             criados += 1
 
-        _cache.clear()
-        _cache.update(novo_cache)
+        validos = [(cpf, m) for cpf, m in novo_meta.items() if m["embedding"] is not None]
+        nova_matrix = (
+            np.stack([m["embedding"] for _, m in validos]).astype(np.float32)
+            if validos
+            else np.zeros((0, _EMB_DIM), dtype=np.float32)
+        )
+
+        _meta.clear()
+        _meta.update(novo_meta)
         _invalidas.clear()
         _invalidas.update(novas_invalidas)
+        _cpfs = [cpf for cpf, _ in validos]
+        _nomes = [m["nome"] for _, m in validos]
+        _matrix = nova_matrix
         _last_refresh = time.time()
 
         resumo = {
             "pessoas_na_tabela": len(pessoas),
-            "embeddings_em_cache": len(_cache),
+            "embeddings_em_cache": len(_cpfs),
             "novos_ou_atualizados": criados,
             "reaproveitados": reaproveitados,
-            "fotos_com_problema": falhas,
+            "fotos_com_problema": len(_invalidas),
             "duracao_segundos": round(time.time() - inicio, 3),
         }
         logger.info("Cache de rostos atualizado: %s", resumo)
         return resumo
 
 
-def ensure_loaded() -> None:
-    """Atualiza o cache se ele nunca foi carregado ou se o TTL expirou."""
-    if time.time() - _last_refresh >= config.FACE_CACHE_TTL_SECONDS:
-        refresh()
-
-
-def all_embeddings() -> List[Tuple[str, str, np.ndarray]]:
-    """Retorna [(cpf, nome, embedding), ...] com o cache já atualizado."""
-    ensure_loaded()
-    with _lock:
-        return [(v["cpf"], v["nome"], v["embedding"]) for v in _cache.values()]
-
-
 def identify(embedding: np.ndarray) -> Tuple[Optional[str], Optional[str], float]:
     """
-    Compara o embedding recebido com todos os cadastrados.
-    Retorna (cpf, nome, similaridade) do melhor match, ou (None, None, sim)
-    se ninguém passar do limiar de similaridade.
+    Compara o embedding (já L2-normalizado) com todos os cadastrados de uma
+    vez só. Retorna (cpf, nome, similaridade) do melhor match, ou
+    (None, None, melhor_similaridade) se ninguém passar do limiar.
     """
-    melhor_cpf = melhor_nome = None
-    melhor_sim = -1.0
+    cpfs, nomes, matrix = _cpfs, _nomes, _matrix  # snapshot consistente
+    if matrix.shape[0] == 0:
+        return None, None, 0.0
 
-    for cpf, nome, conhecido in all_embeddings():
-        sim = fe.cosine_similarity(embedding, conhecido)
-        if sim > melhor_sim:
-            melhor_cpf, melhor_nome, melhor_sim = cpf, nome, sim
-
-    if melhor_sim < config.SIMILARITY_THRESHOLD:
-        return None, None, melhor_sim
-    return melhor_cpf, melhor_nome, melhor_sim
+    scores = matrix @ embedding
+    i = int(np.argmax(scores))
+    melhor = float(scores[i])
+    if melhor < config.SIMILARITY_THRESHOLD:
+        return None, None, melhor
+    return cpfs[i], nomes[i], melhor
 
 
 def status() -> dict:
     """Informações do cache, úteis para diagnóstico."""
-    with _lock:
-        return {
-            "embeddings_em_cache": len(_cache),
-            "ultima_atualizacao": (
-                time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(_last_refresh))
-                if _last_refresh
-                else None
-            ),
-            "ttl_segundos": config.FACE_CACHE_TTL_SECONDS,
-            "limiar_similaridade": config.SIMILARITY_THRESHOLD,
-            "fotos_com_problema": [
-                {"cpf": cpf, "motivo": motivo} for cpf, motivo in _invalidas.items()
-            ],
-        }
+    return {
+        "embeddings_em_cache": len(_cpfs),
+        "ultima_atualizacao": (
+            time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(_last_refresh)) if _last_refresh else None
+        ),
+        "ttl_segundos": config.FACE_CACHE_TTL_SECONDS,
+        "limiar_similaridade": config.SIMILARITY_THRESHOLD,
+        "det_size": config.FACE_DET_SIZE,
+        "fotos_com_problema": [{"cpf": cpf, "motivo": motivo} for cpf, motivo in _invalidas.items()],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Atualização em segundo plano
+# ---------------------------------------------------------------------------
+
+def _loop():
+    while not _stop.wait(config.FACE_CACHE_TTL_SECONDS):
+        try:
+            refresh()
+        except Exception as exc:  # banco fora do ar não pode matar a thread
+            logger.warning("Falha ao atualizar o cache de rostos: %s", exc)
+
+
+def start_background_refresh() -> None:
+    """Inicia a thread que mantém o cache sincronizado com a tabela `pessoa`."""
+    global _thread
+    if _thread is None or not _thread.is_alive():
+        _stop.clear()
+        _thread = threading.Thread(target=_loop, name="face-store-refresh", daemon=True)
+        _thread.start()
+
+
+def stop_background_refresh() -> None:
+    _stop.set()
