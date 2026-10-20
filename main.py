@@ -148,9 +148,6 @@ def serve_frontend():
     return FileResponse("static/index.html")
 
 
-app.mount("/static", StaticFiles(directory="static"), name="static")
-
-
 # ---------------------------------------------------------------------------
 # Pessoas (leitura do banco — cadastro é feito por outra API)
 # ---------------------------------------------------------------------------
