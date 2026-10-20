@@ -3,8 +3,7 @@ uvicorn[standard]
 python-multipart
 insightface
 onnxruntime
-opencv-python-headless
+opencv-python
 numpy
-pillow
 python-dotenv
 requests

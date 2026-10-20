@@ -1,137 +1,106 @@
 """
 face_engine.py
-Motor de detecção + reconhecimento facial usando InsightFace (RetinaFace + ArcFace),
-rodando via ONNX Runtime. Não depende de dlib/face_recognition.
+
+Detecção + reconhecimento facial com InsightFace (SCRFD + ArcFace) rodando
+no ONNX Runtime.
+
+Só dois modelos do pacote são carregados (detecção e reconhecimento): os de
+idade/gênero e landmarks 2D/3D não servem para a catraca e dobravam o tempo
+de cada requisição.
 """
 
 import base64
 import binascii
-import io
 import logging
 import re
+import threading
 from typing import Optional, Tuple
 
+import cv2
 import numpy as np
-from PIL import Image
+
+import config
 
 logger = logging.getLogger("face_engine")
 
-_APP = None  # instância singleton do FaceAnalysis
+_APP = None
+# O ONNX Runtime já usa todos os núcleos numa inferência; duas em paralelo
+# só se atrapalham. O lock deixa a latência previsível.
+_LOCK = threading.Lock()
 
-_DATA_URI_RE = re.compile(r"^data:(?P<mime>[\w/\-.+]+)?;base64,", re.IGNORECASE)
-
-
-def get_engine():
-    """
-    Cria (uma única vez) e retorna a instância do FaceAnalysis do InsightFace.
-    Usa o pacote 'buffalo_l' (detector RetinaFace + embeddings ArcFace, 512-d).
-    Troque providers para ['CUDAExecutionProvider', 'CPUExecutionProvider']
-    se você tiver GPU NVIDIA + onnxruntime-gpu instalado.
-    """
-    global _APP
-    if _APP is None:
-        from insightface.app import FaceAnalysis
-
-        logger.info("Carregando modelo InsightFace (buffalo_l)...")
-        _APP = FaceAnalysis(name="buffalo_l", providers=["CPUExecutionProvider"])
-        _APP.prepare(ctx_id=0, det_size=(640, 640))
-        logger.info("Modelo carregado.")
-    return _APP
-
-
-def decode_base64_image(foto: str) -> Tuple[bytes, str]:
-    """
-    Converte a foto vinda do banco (string base64) em bytes de imagem.
-    Aceita tanto base64 puro quanto data URI ("data:image/jpeg;base64,...").
-    Retorna (bytes, mime_type).
-
-    Levanta ValueError se a string não for um base64 válido.
-    """
-    if not foto:
-        raise ValueError("Foto vazia.")
-
-    mime = "image/jpeg"
-    texto = foto.strip()
-
-    match = _DATA_URI_RE.match(texto)
-    if match:
-        mime = match.group("mime") or mime
-        texto = texto[match.end():]
-
-    # Remove quebras de linha/espaços que costumam vir de base64 formatado.
-    texto = re.sub(r"\s+", "", texto)
-
-    try:
-        image_bytes = base64.b64decode(texto, validate=True)
-    except (binascii.Error, ValueError) as exc:
-        raise ValueError(f"Base64 inválido: {exc}") from exc
-
-    if not match:
-        mime = _sniff_mime(image_bytes)
-    return image_bytes, mime
-
-
-def _sniff_mime(image_bytes: bytes) -> str:
-    """Descobre o tipo da imagem pelos primeiros bytes (fallback: jpeg)."""
-    if image_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
-        return "image/png"
-    if image_bytes.startswith(b"GIF8"):
-        return "image/gif"
-    if image_bytes.startswith(b"BM"):
-        return "image/bmp"
-    if image_bytes[:4] == b"RIFF" and image_bytes[8:12] == b"WEBP":
-        return "image/webp"
-    return "image/jpeg"
+_DATA_URI_RE = re.compile(r"^data:[\w/\-.+]*;base64,", re.IGNORECASE)
+_WS_RE = re.compile(r"\s+")
 
 
 class InvalidImageError(ValueError):
-    """Arquivo enviado não é uma imagem válida."""
+    """Os bytes recebidos não são uma imagem decodificável."""
 
 
-def bytes_to_bgr_image(image_bytes: bytes) -> np.ndarray:
-    """Converte bytes de imagem (jpg/png/etc) em array BGR (formato OpenCV)."""
+def get_engine():
+    """Cria (uma única vez) o FaceAnalysis com detecção + reconhecimento e aquece o modelo."""
+    global _APP
+    with _LOCK:
+        if _APP is None:
+            from insightface.app import FaceAnalysis
+
+            logger.info("Carregando modelo InsightFace (%s)...", config.FACE_MODEL)
+            app = FaceAnalysis(
+                name=config.FACE_MODEL,
+                allowed_modules=["detection", "recognition"],
+                providers=["CPUExecutionProvider"],
+            )
+            app.prepare(ctx_id=0, det_size=(config.FACE_DET_SIZE, config.FACE_DET_SIZE))
+            # A primeira inferência é mais lenta (alocações internas do ONNX
+            # Runtime): faz uma agora para a primeira requisição real não pagar.
+            dummy = np.zeros((config.FACE_DET_SIZE, config.FACE_DET_SIZE, 3), dtype=np.uint8)
+            app.get(dummy, max_num=1)
+            _APP = app
+            logger.info("Modelo carregado (det_size=%d).", config.FACE_DET_SIZE)
+    return _APP
+
+
+def decode_base64_image(foto: str) -> bytes:
+    """
+    Converte a foto vinda do banco (string base64, com ou sem prefixo data URI)
+    em bytes de imagem. Levanta ValueError se não for base64 válido.
+    """
+    if not foto:
+        raise ValueError("Foto vazia.")
+    texto = _DATA_URI_RE.sub("", foto.strip(), count=1)
+    texto = _WS_RE.sub("", texto)
     try:
-        img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-    except Exception as exc:
-        raise InvalidImageError("O arquivo enviado não é uma imagem válida.") from exc
-    arr = np.array(img)  # RGB
-    return arr[:, :, ::-1].copy()  # -> BGR
+        return base64.b64decode(texto, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError(f"Base64 inválido: {exc}") from exc
 
 
-def extract_faces(image_bytes: bytes):
+def bytes_to_bgr(image_bytes: bytes) -> np.ndarray:
+    """Decodifica jpg/png/webp direto para BGR com OpenCV (2-3x mais rápido que PIL + conversão)."""
+    img = cv2.imdecode(np.frombuffer(image_bytes, np.uint8), cv2.IMREAD_COLOR)
+    if img is None:
+        raise InvalidImageError("O arquivo enviado não é uma imagem válida.")
+    return img
+
+
+def best_face_embedding(image_bytes: bytes) -> Tuple[Optional[np.ndarray], float]:
     """
-    Detecta todos os rostos em uma imagem e retorna a lista de objetos Face
-    do InsightFace (cada um com .bbox, .kps, .det_score, .embedding, .normed_embedding).
+    Detecta o rosto principal da imagem (o maior e mais central — numa catraca,
+    quem está na frente da câmera) e devolve seu embedding L2-normalizado
+    (512-d, float32) e a confiança da detecção. (None, 0.0) se não houver rosto.
+
+    Só esse rosto passa pelo modelo de reconhecimento, que é a etapa mais cara.
     """
+    img = bytes_to_bgr(image_bytes)
     engine = get_engine()
-    img_bgr = bytes_to_bgr_image(image_bytes)
-    faces = engine.get(img_bgr)
-    return faces, img_bgr
-
-
-def get_single_embedding(image_bytes: bytes) -> Optional[np.ndarray]:
-    """
-    Retorna o embedding normalizado (512-d, float32) do rosto de maior confiança
-    encontrado na imagem, ou None se nenhum rosto for detectado.
-    """
-    faces, _ = extract_faces(image_bytes)
+    with _LOCK:
+        faces = engine.get(img, max_num=1)
     if not faces:
-        return None
-    best = max(faces, key=lambda f: f.det_score)
-    return best.normed_embedding.astype(np.float32)
+        return None, 0.0
+    face = faces[0]
+    return face.normed_embedding.astype(np.float32), float(face.det_score)
 
 
 def embedding_from_base64(foto: str) -> Optional[np.ndarray]:
-    """
-    Atalho: recebe a foto em base64 (como está salva na tabela `pessoa`) e
-    devolve o embedding do rosto. None se não houver rosto detectável.
-    """
-    image_bytes, _ = decode_base64_image(foto)
-    return get_single_embedding(image_bytes)
-
-
-def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
-    """Similaridade de cosseno entre dois embeddings normalizados (-1 a 1)."""
-    a = a / (np.linalg.norm(a) + 1e-10)
-    b = b / (np.linalg.norm(b) + 1e-10)
-    return float(np.dot(a, b))
+    """Embedding do rosto de uma foto como está salva na tabela `pessoa`."""
+    emb, _ = best_face_embedding(decode_base64_image(foto))
+    return emb
