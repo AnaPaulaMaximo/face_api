@@ -9,6 +9,12 @@ Uso:
 
 Atenção: se a foto for de alguém cadastrado, o acesso É registrado no banco
 (a primeira chamada; as seguintes caem no cooldown).
+
+Com FACE_LIVENESS=true na API, mostre a mesma foto na tela do celular (ou
+impressa) para a câmera: a resposta deve ser `motivo: "rosto_nao_vivo"`.
+
+No Windows, use --url http://127.0.0.1:8000: `localhost` tenta IPv6 primeiro
+e cada requisição ganha ~2 s de espera que não é da API.
 """
 
 import argparse
@@ -43,6 +49,7 @@ def main():
     print(f"arquivo invalido -> HTTP {r.status_code} ({'ok' if r.status_code == 422 else 'ERRADO'})")
 
     tempos = []
+    tempos_servidor = []
     resposta = None
     for _ in range(a.n):
         t = time.perf_counter()
@@ -50,6 +57,7 @@ def main():
         tempos.append((time.perf_counter() - t) * 1000)
         resposta = r
         r.raise_for_status()
+        tempos_servidor.append(r.json()["tempo_ms"])
 
     print("\nresposta:")
     print(json.dumps(resposta.json(), indent=2, ensure_ascii=False))
@@ -57,6 +65,10 @@ def main():
         print(
             f"\nlatência ponta a ponta ({a.n}x): mediana {statistics.median(tempos):.0f} ms | "
             f"mín {min(tempos):.0f} ms | máx {max(tempos):.0f} ms"
+        )
+        print(
+            f"tempo dentro da API (tempo_ms): mediana {statistics.median(tempos_servidor):.0f} ms | "
+            f"mín {min(tempos_servidor)} ms | máx {max(tempos_servidor)} ms"
         )
 
 
