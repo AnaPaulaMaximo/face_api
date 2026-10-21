@@ -69,6 +69,19 @@ FACE_DET_SIZE = int(os.getenv("FACE_DET_SIZE", "320"))
 # Tamanho máximo (bytes) da imagem aceita em POST /faces/recognize.
 MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(10 * 1024 * 1024)))
 
+# --- Anti-spoofing (rosto vivo) ---
+# Com True, o addon `liveness` do InsightFace avalia se o rosto na frente da
+# câmera é de uma pessoa real ou de uma foto/tela/impressão ANTES de reconhecer.
+# Rosto reprovado não passa pelo ArcFace e a resposta é `rosto_nao_vivo`.
+# Na primeira execução o InsightFace baixa `liveness.onnx` (~1,5 MB) para
+# ~/.insightface/addons/ (para uso offline, copie o arquivo para lá antes).
+FACE_LIVENESS = _env_bool("FACE_LIVENESS", "true")
+
+# Probabilidade mínima (0 a 1) de ser rosto vivo. Abaixo disso o acesso é
+# recusado. 0.8 é o padrão do InsightFace; baixe para 0.6–0.7 se pessoas reais
+# estiverem sendo recusadas (iluminação ruim), suba se foto ainda passar.
+LIVENESS_THRESHOLD = float(os.getenv("LIVENESS_THRESHOLD", "0.8"))
+
 
 def missing_d1_settings() -> list:
     """Nomes das variáveis do Cloudflare D1 que ainda não foram preenchidas."""

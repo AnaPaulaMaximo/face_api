@@ -6,7 +6,8 @@ O CADASTRO NÃO ACONTECE AQUI: as pessoas são cadastradas por outra API, que
 grava na tabela `pessoa` (cpf, nome, foto em base64). Esta API apenas:
 
   1. lê as fotos da tabela `pessoa` e mantém os embeddings em memória;
-  2. reconhece o rosto enviado pelo frontend e responde liberado/recusado;
+  2. verifica se o rosto enviado pelo frontend é de uma pessoa viva (e não
+     uma foto no celular/impressa), reconhece e responde liberado/recusado;
   3. grava o log de entrada/saída na tabela `logs` (em segundo plano).
 
 Endpoints:
@@ -98,10 +99,13 @@ class Acesso(BaseModel):
 
 class Reconhecimento(BaseModel):
     autorizado: bool
-    motivo: Optional[Literal["nenhum_rosto", "nao_reconhecido"]] = None
+    motivo: Optional[Literal["nenhum_rosto", "rosto_nao_vivo", "rosto_cortado", "nao_reconhecido"]] = None
     cpf: Optional[str] = None
     nome: Optional[str] = None
     similaridade: float
+    # Probabilidade (0 a 1) de o rosto ser de uma pessoa real. None quando o
+    # anti-spoofing está desligado (FACE_LIVENESS=false) ou não foi avaliado.
+    live_score: Optional[float] = None
     acesso: Optional[Acesso] = None
     tempo_ms: int
 
@@ -120,7 +124,11 @@ class LogRecord(BaseModel):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "embeddings_em_cache": store.status()["embeddings_em_cache"]}
+    return {
+        "status": "ok",
+        "embeddings_em_cache": store.status()["embeddings_em_cache"],
+        "anti_spoofing": config.FACE_LIVENESS,
+    }
 
 
 @app.get("/", include_in_schema=False)
@@ -133,9 +141,10 @@ def root():
 @app.post("/faces/recognize", response_model=Reconhecimento)
 def recognize_face(background: BackgroundTasks, file: UploadFile = File(...)):
     """
-    Recebe a foto da câmera, identifica o rosto principal e responde se o
-    acesso está autorizado. Quando autorizado, decide entrada/saída na hora e
-    grava o log no banco em segundo plano (a resposta não espera o D1).
+    Recebe a foto da câmera, identifica o rosto principal, confere se é um
+    rosto vivo (com FACE_LIVENESS=true) e responde se o acesso está
+    autorizado. Quando autorizado, decide entrada/saída na hora e grava o log
+    no banco em segundo plano (a resposta não espera o D1).
     """
     inicio = time.perf_counter()
 
@@ -143,13 +152,21 @@ def recognize_face(background: BackgroundTasks, file: UploadFile = File(...)):
     if len(image_bytes) > config.MAX_UPLOAD_BYTES:
         raise HTTPException(status_code=413, detail="Imagem maior que o limite permitido.")
 
-    embedding, _ = fe.best_face_embedding(image_bytes)
-    if embedding is None:
+    rosto = fe.analyze_main_face(image_bytes)
+    if not rosto.has_face:
         return _resposta(inicio, autorizado=False, motivo="nenhum_rosto", similaridade=0.0)
 
-    cpf, nome, sim = store.identify(embedding)
+    if rosto.embedding is None:
+        # Anti-spoofing reprovou (foto/tela/impressão) ou não conseguiu avaliar
+        # porque o rosto está cortado demais na imagem (precisa de margem ao redor).
+        motivo = "rosto_cortado" if rosto.liveness_status == "input_rejected" else "rosto_nao_vivo"
+        return _resposta(inicio, autorizado=False, motivo=motivo, similaridade=0.0, live_score=rosto.live_score)
+
+    cpf, nome, sim = store.identify(rosto.embedding)
     if cpf is None:
-        return _resposta(inicio, autorizado=False, motivo="nao_reconhecido", similaridade=sim)
+        return _resposta(
+            inicio, autorizado=False, motivo="nao_reconhecido", similaridade=sim, live_score=rosto.live_score
+        )
 
     decisao = access.decidir(cpf)
     if decisao["registrado"]:
@@ -161,6 +178,7 @@ def recognize_face(background: BackgroundTasks, file: UploadFile = File(...)):
         cpf=cpf,
         nome=nome,
         similaridade=sim,
+        live_score=rosto.live_score,
         acesso={
             "tipo": decisao["tipo"],
             "data_hora": decisao["data_hora"].isoformat(),
@@ -171,6 +189,8 @@ def recognize_face(background: BackgroundTasks, file: UploadFile = File(...)):
 
 def _resposta(inicio: float, **campos) -> dict:
     campos["similaridade"] = round(campos["similaridade"], 4)
+    if campos.get("live_score") is not None:
+        campos["live_score"] = round(campos["live_score"], 4)
     campos["tempo_ms"] = int((time.perf_counter() - inicio) * 1000)
     return campos
 
