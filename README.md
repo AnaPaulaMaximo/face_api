@@ -1,8 +1,9 @@
 # Face API — reconhecimento facial para catraca
 
-API REST em FastAPI que recebe a foto da câmera, reconhece o rosto com
-InsightFace (SCRFD + ArcFace) e responde **na hora** se o acesso está
-autorizado, gravando o log de entrada/saída no **Cloudflare D1**.
+API REST em FastAPI que recebe a foto da câmera, confere que é um **rosto
+vivo** (e não uma foto no celular ou impressa), reconhece com InsightFace
+(SCRFD + ArcFace) e responde **na hora** se o acesso está autorizado, gravando
+o log de entrada/saída no **Cloudflare D1**.
 
 O **cadastro não é feito aqui**. Outra API cadastra as pessoas na tabela
 `pessoa`, salvando a foto como **string base64**. Esta API lê essas fotos,
@@ -32,7 +33,9 @@ Na subida a API testa a conexão com o D1, cria as tabelas (se
 `AUTO_CREATE_TABLES=true`), carrega e aquece o modelo, gera os embeddings de
 todas as pessoas e carrega o último registro de cada uma. Só então começa a
 aceitar requisições. Na primeira execução o InsightFace baixa o pacote
-`buffalo_l` (~300 MB).
+`buffalo_l` (~300 MB) e, com `FACE_LIVENESS=true` (padrão), o modelo de
+anti-spoofing `liveness.onnx` (~1,5 MB, para `~/.insightface/addons/`). Para
+rodar sem internet, copie os dois para lá antes.
 
 Documentação interativa em `http://localhost:8000/docs` (a rota `/` redireciona para ela).
 
@@ -40,9 +43,9 @@ Documentação interativa em `http://localhost:8000/docs` (a rota `/` redirecion
 
 | Método | Rota | O que faz |
 |---|---|---|
-| POST | `/faces/recognize` | recebe a foto, identifica o rosto e **responde autorizado/recusado**, gravando o log |
+| POST | `/faces/recognize` | recebe a foto, confere se é um **rosto vivo**, identifica e **responde autorizado/recusado**, gravando o log |
 | GET | `/access/logs` | lista os logs (filtros: `cpf`, `tipo`, `date_from`, `date_to`, `limit`) |
-| GET | `/health` | healthcheck (inclui quantos rostos estão em memória) |
+| GET | `/health` | healthcheck (quantos rostos estão em memória e se o anti-spoofing está ligado) |
 | GET | `/faces/cache` | status do cache de embeddings e quais fotos cadastradas deram problema |
 | POST | `/faces/reload` | força reler a tabela `pessoa` e recalcular todos os embeddings |
 
@@ -66,17 +69,30 @@ Resposta quando a pessoa é reconhecida:
   "cpf": "12345678900",
   "nome": "Fulano",
   "similaridade": 0.7412,
+  "live_score": 0.9758,
   "acesso": { "tipo": "entrada", "data_hora": "2026-01-20T13:05:11.204000+00:00", "registrado": true },
-  "tempo_ms": 231
+  "tempo_ms": 232
 }
 ```
 
 Quando não é:
 
 ```json
-{ "autorizado": false, "motivo": "nao_reconhecido", "similaridade": 0.21, "tempo_ms": 228 }
-{ "autorizado": false, "motivo": "nenhum_rosto",    "similaridade": 0.0,  "tempo_ms": 60 }
+{ "autorizado": false, "motivo": "nao_reconhecido", "similaridade": 0.21, "live_score": 0.93, "tempo_ms": 235 }
+{ "autorizado": false, "motivo": "rosto_nao_vivo",  "similaridade": 0.0,  "live_score": 0.01, "tempo_ms": 75 }
+{ "autorizado": false, "motivo": "rosto_cortado",   "similaridade": 0.0,  "live_score": null, "tempo_ms": 65 }
+{ "autorizado": false, "motivo": "nenhum_rosto",    "similaridade": 0.0,  "live_score": null, "tempo_ms": 60 }
 ```
+
+| `motivo` | O que aconteceu | O que o frontend pode mostrar |
+|---|---|---|
+| `nenhum_rosto` | nenhum rosto detectado | "Aproxime-se da câmera" |
+| `rosto_nao_vivo` | o rosto parece ser uma foto (celular, impressão, tela): `live_score` abaixo de `LIVENESS_THRESHOLD` | "Acesso negado" |
+| `rosto_cortado` | o rosto está colado demais na borda ou ocupa a imagem inteira; o anti-spoofing precisa de margem ao redor para avaliar | "Afaste-se um pouco da câmera" |
+| `nao_reconhecido` | rosto vivo, mas não bate com ninguém cadastrado | "Acesso negado" |
+
+- `live_score` é a probabilidade (0 a 1) de o rosto ser de uma pessoa real.
+  Vem `null` com `FACE_LIVENESS=false` ou quando não deu para avaliar.
 
 - `acesso.registrado = false` significa que a pessoa foi reconhecida, mas já
   havia um registro dela dentro de `ACCESS_COOLDOWN_SECONDS` (frame repetido);
@@ -96,7 +112,7 @@ para a câmera não gerar vários logs com frames seguidos.
 ## Por que é rápido
 
 Numa CPU comum (8 threads) o `POST /faces/recognize` responde em **~230 ms**
-(era ~1,8 s). O que foi feito:
+(era ~1,8 s), ou ~240 ms com o anti-spoofing ligado. O que foi feito:
 
 | Antes | Agora |
 |---|---|
@@ -112,10 +128,53 @@ Numa CPU comum (8 threads) o `POST /faces/recognize` responde em **~230 ms**
 
 Frames sem rosto são rejeitados em ~60 ms (só a detecção roda).
 
+### Custo do anti-spoofing
+
+Medido na mesma máquina, mediana de 30 envios da mesma foto pelo
+`test_client.py` (`tempo_ms` do servidor):
+
+| Situação | `FACE_LIVENESS=false` | `FACE_LIVENESS=true` |
+|---|---|---|
+| rosto vivo, reconhecido | 230 ms | **~240 ms** (+10 ms) |
+| foto de foto (`rosto_nao_vivo`) | 230 ms (e liberava) | **~75 ms** |
+| rosto cortado (`rosto_cortado`) | 230 ms | ~65 ms |
+
+O modelo de liveness é pequeno (entrada 80×80, 1,5 MB) e roda em ~9 ms entre
+a detecção e o reconhecimento; rosto reprovado nem passa pelo ArcFace, por
+isso a recusa é mais rápida que um acesso liberado. Um detalhe que importa:
+a sessão ONNX do addon é criada com **uma thread e sem spin-wait**
+(`face_engine.py`). Com o pool de threads padrão, as threads do liveness
+ficavam girando depois da inferência e roubavam CPU do ArcFace, e o addon
+custava +76 ms por requisição em vez de +12 ms.
+
 Se a câmera ficar longe e rostos pequenos não forem detectados, suba
 `FACE_DET_SIZE` para 480 ou 640 (custo medido: 320 → 63 ms de detecção,
 480 → 143 ms, 640 → 245 ms). Para CPUs fracas, `FACE_MODEL=buffalo_s` é bem
 mais leve, mas o `SIMILARITY_THRESHOLD` precisa ser recalibrado.
+
+## Anti-spoofing (rosto vivo)
+
+Sem isso, uma foto de alguém cadastrado mostrada no celular para a câmera
+liberava a catraca. Com `FACE_LIVENESS=true` (padrão) o addon `liveness` do
+InsightFace 2.0 classifica o rosto detectado como vivo ou não **antes** do
+reconhecimento:
+
+- `live_score >= LIVENESS_THRESHOLD` (padrão 0.8): segue para o ArcFace;
+- abaixo: `autorizado: false, motivo: "rosto_nao_vivo"` (sem embedding, sem log);
+- rosto colado na borda / sem margem ao redor: `motivo: "rosto_cortado"`
+  (o addon exige que a região alinhada ao redor do rosto caiba na imagem).
+
+As fotos de cadastro (tabela `pessoa`) **não** passam por essa checagem: elas
+são fotos e precisam virar embedding mesmo assim.
+
+Calibrando o limiar: se pessoas reais estiverem sendo recusadas (iluminação
+ruim, câmera de baixa qualidade), baixe `LIVENESS_THRESHOLD` para 0.6–0.7 e
+observe o `live_score` nas respostas; se foto ainda passar, suba. Para
+desligar de vez, `FACE_LIVENESS=false` (o modelo nem é carregado).
+
+É um modelo de imagem única (sem pedir para piscar ou mexer a cabeça):
+protege contra foto no celular, impressão e replay em tela, não contra
+máscaras 3D.
 
 ## Como funciona o cache de rostos
 
@@ -190,6 +249,8 @@ ajuste `PESSOA_TABLE`, `PESSOA_PK`, `PESSOA_NOME_COL`, `PESSOA_FOTO_COL`,
 | `FACE_CACHE_TTL_SECONDS` | `60` | de quanto em quanto tempo a thread de fundo relê a tabela `pessoa` |
 | `FACE_DET_SIZE` | `320` | resolução do detector (320 catraca; 480/640 câmera longe) |
 | `FACE_MODEL` | `buffalo_l` | pacote de modelos do InsightFace |
+| `FACE_LIVENESS` | `true` | anti-spoofing: recusa foto/tela/impressão (`rosto_nao_vivo`); custa ~10 ms por requisição |
+| `LIVENESS_THRESHOLD` | `0.8` | probabilidade mínima de rosto vivo (0 a 1); baixe para 0.6–0.7 se pessoas reais forem recusadas |
 | `MAX_UPLOAD_BYTES` | `10485760` | tamanho máximo da imagem enviada |
 | `AUTO_CREATE_TABLES` | `true` | cria as tabelas se não existirem (deixe `false` em produção) |
 | `D1_TIMEOUT_SECONDS` | `15` | timeout de cada chamada ao D1 |
@@ -204,12 +265,19 @@ python test_client.py foto.jpg -n 20    # repete 20x e mede a latência
 Se a foto for de alguém cadastrado, o acesso é registrado no banco (a
 primeira chamada; as seguintes caem no cooldown).
 
+Para testar o anti-spoofing, aponte a câmera para a mesma foto exibida na
+tela do celular ou impressa: a resposta deve vir com `motivo: "rosto_nao_vivo"`
+e `live_score` baixo. Um rosto que ocupa a imagem inteira dá `rosto_cortado`.
+
+No Windows use `--url http://127.0.0.1:8000`: `localhost` tenta IPv6 primeiro
+e cada requisição ganha ~2 s de espera que não é da API.
+
 ## Arquivos
 
 | Arquivo | Papel |
 |---|---|
 | `main.py` | endpoints FastAPI |
-| `face_engine.py` | InsightFace (detecção + reconhecimento) e decodificação de imagem |
+| `face_engine.py` | InsightFace (detecção + anti-spoofing + reconhecimento) e decodificação de imagem |
 | `face_store.py` | cache em memória dos embeddings (matriz NumPy) + thread de atualização |
 | `access.py` | decide entrada/saída, cooldown e grava o log em segundo plano |
 | `database.py` | acesso ao Cloudflare D1 via API REST (lê `pessoa`, escreve `logs`) |
@@ -249,6 +317,20 @@ git push origin main develop release/1.2.0 --tags
 A versão da API (`version=` em `main.py`) deve acompanhar a tag da release.
 
 ## Histórico de versões
+
+### 1.2.0
+
+- Anti-spoofing em `POST /faces/recognize` com o addon `liveness` do
+  InsightFace 2.0 (`FACE_LIVENESS`, padrão ligado; `LIVENESS_THRESHOLD`,
+  padrão 0.8): foto no celular, impressão ou tela na frente da câmera é
+  recusada com `motivo: "rosto_nao_vivo"`. Rosto sem margem ao redor para
+  ser avaliado recebe `motivo: "rosto_cortado"`.
+- Resposta ganha `live_score`; `GET /health` informa `anti_spoofing`.
+- Custo medido: ~+10 ms por acesso liberado (230 para ~240 ms); foto de foto
+  é recusada em ~75 ms. A sessão ONNX do addon roda com uma thread e sem
+  spin-wait para não atrapalhar o ArcFace.
+- Na primeira execução baixa `liveness.onnx` (~1,5 MB) para `~/.insightface/addons/`.
+- `test_client.py` mostra também a mediana do `tempo_ms` do servidor.
 
 ### 1.1.0
 
