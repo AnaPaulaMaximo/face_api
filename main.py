@@ -22,6 +22,7 @@ Rode com:
 """
 
 import logging
+import threading
 import time
 from contextlib import asynccontextmanager
 from datetime import date
@@ -42,17 +43,37 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 logger = logging.getLogger("face_api")
 
 
+# Sinaliza o fim do carregamento inicial (modelo + cache + últimos registros).
+_startup_concluido = threading.Event()
+
+
+def _carregar_em_segundo_plano():
+    """Carrega o modelo e o cache sem segurar a abertura da porta HTTP.
+
+    Em máquinas fracas (ex.: plano Free do Render, 0,1 CPU) o modelo leva
+    minutos para carregar, e o Render desiste se a porta não abrir antes.
+    O POST /faces/recognize espera este carregamento terminar.
+    """
+    try:
+        fe.get_engine()  # carrega e aquece o modelo
+        try:
+            store.refresh(force=True)
+            logger.info("Últimos registros carregados: %d pessoa(s).", access.carregar_ultimos())
+        except Exception as exc:  # banco fora do ar não deve derrubar a API inteira
+            logger.warning("Não foi possível carregar os dados do banco no startup: %s", exc)
+        store.start_background_refresh()
+        logger.info("API pronta.")
+    except Exception:
+        logger.exception("Falha ao carregar o modelo no startup.")
+    finally:
+        # Mesmo com falha libera as requisições: elas tentam carregar o modelo de novo
+        _startup_concluido.set()
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     db.init_db()
-    fe.get_engine()  # carrega e aquece o modelo antes de aceitar requisições
-    try:
-        store.refresh(force=True)
-        logger.info("Últimos registros carregados: %d pessoa(s).", access.carregar_ultimos())
-    except Exception as exc:  # banco fora do ar não deve derrubar a API inteira
-        logger.warning("Não foi possível carregar os dados do banco no startup: %s", exc)
-    store.start_background_refresh()
-    logger.info("API pronta.")
+    threading.Thread(target=_carregar_em_segundo_plano, name="startup", daemon=True).start()
     yield
     store.stop_background_refresh()
 
@@ -64,7 +85,7 @@ app = FastAPI(
         "As pessoas e suas fotos (base64) vêm da tabela `pessoa`, alimentada por "
         "outra API. Aqui só são gravados os logs de entrada/saída."
     ),
-    version="1.3.0",
+    version="1.3.1",
     lifespan=lifespan,
 )
 
@@ -126,6 +147,8 @@ class LogRecord(BaseModel):
 def health():
     return {
         "status": "ok",
+        "pronta": _startup_concluido.is_set(),
+        "modelo_carregado": fe.is_loaded(),
         "embeddings_em_cache": store.status()["embeddings_em_cache"],
         "anti_spoofing": config.FACE_LIVENESS,
     }
@@ -146,6 +169,7 @@ def recognize_face(background: BackgroundTasks, file: UploadFile = File(...)):
     autorizado. Quando autorizado, decide entrada/saída na hora e grava o log
     no banco em segundo plano (a resposta não espera o D1).
     """
+    _startup_concluido.wait()
     inicio = time.perf_counter()
 
     image_bytes = file.file.read(config.MAX_UPLOAD_BYTES + 1)

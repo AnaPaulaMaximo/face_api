@@ -99,6 +99,11 @@ def get_engine():
     return _APP
 
 
+def is_loaded() -> bool:
+    """True quando o modelo já foi carregado e aquecido."""
+    return _APP is not None
+
+
 def _build_liveness():
     """
     Sessão ONNX do addon `liveness` com UMA thread e sem spin-wait.
