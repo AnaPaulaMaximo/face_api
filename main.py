@@ -45,26 +45,36 @@ logger = logging.getLogger("face_api")
 
 # Sinaliza o fim do carregamento inicial (modelo + cache + últimos registros).
 _startup_concluido = threading.Event()
+# Erros do carregamento inicial, expostos no /health para diagnosticar o deploy.
+_erros_startup: List[str] = []
 
 
 def _carregar_em_segundo_plano():
-    """Carrega o modelo e o cache sem segurar a abertura da porta HTTP.
+    """Conecta no banco e carrega o modelo e o cache sem segurar a porta HTTP.
 
     Em máquinas fracas (ex.: plano Free do Render, 0,1 CPU) o modelo leva
     minutos para carregar, e o Render desiste se a porta não abrir antes.
+    Falha no banco também não derruba o processo: aparece no /health.
     O POST /faces/recognize espera este carregamento terminar.
     """
     try:
+        try:
+            db.init_db()
+        except Exception as exc:
+            logger.exception("Falha ao conectar no Cloudflare D1 no startup.")
+            _erros_startup.append(f"banco: {exc}")
         fe.get_engine()  # carrega e aquece o modelo
         try:
             store.refresh(force=True)
             logger.info("Últimos registros carregados: %d pessoa(s).", access.carregar_ultimos())
         except Exception as exc:  # banco fora do ar não deve derrubar a API inteira
             logger.warning("Não foi possível carregar os dados do banco no startup: %s", exc)
+            _erros_startup.append(f"cache: {exc}")
         store.start_background_refresh()
         logger.info("API pronta.")
-    except Exception:
+    except Exception as exc:
         logger.exception("Falha ao carregar o modelo no startup.")
+        _erros_startup.append(f"modelo: {exc}")
     finally:
         # Mesmo com falha libera as requisições: elas tentam carregar o modelo de novo
         _startup_concluido.set()
@@ -72,7 +82,6 @@ def _carregar_em_segundo_plano():
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    db.init_db()
     threading.Thread(target=_carregar_em_segundo_plano, name="startup", daemon=True).start()
     yield
     store.stop_background_refresh()
@@ -149,6 +158,8 @@ def health():
         "status": "ok",
         "pronta": _startup_concluido.is_set(),
         "modelo_carregado": fe.is_loaded(),
+        "variaveis_faltando": config.missing_d1_settings(),
+        "erros_startup": _erros_startup,
         "embeddings_em_cache": store.status()["embeddings_em_cache"],
         "anti_spoofing": config.FACE_LIVENESS,
     }
