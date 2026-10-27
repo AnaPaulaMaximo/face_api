@@ -3,9 +3,9 @@ FROM python:3.11-slim
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
-# build-essential: compilar o insightface | libgl1/libglib2.0-0: OpenCV
+# libgl1/libglib2.0-0: OpenCV (todas as dependências Python já vêm como wheel, sem compilar)
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends build-essential libgl1 libglib2.0-0 \
+    && apt-get install -y --no-install-recommends libgl1 libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
