@@ -66,6 +66,11 @@ FACE_MODEL = os.getenv("FACE_MODEL", "buffalo_l")
 # Suba para 480/640 se a câmera ficar longe e rostos pequenos não forem achados.
 FACE_DET_SIZE = int(os.getenv("FACE_DET_SIZE", "320"))
 
+# Threads do ONNX Runtime por sessão (detector e ArcFace). 0 = padrão do ONNX
+# Runtime (uma por núcleo da máquina, mais rápido no PC). Em servidor com fração
+# de núcleo (Render) use 1, senão as threads ficam brigando pela pouca CPU.
+ORT_THREADS = int(os.getenv("ORT_THREADS", "0"))
+
 # Tamanho máximo (bytes) da imagem aceita em POST /faces/recognize.
 MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(10 * 1024 * 1024)))
 
