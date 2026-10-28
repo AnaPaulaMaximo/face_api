@@ -94,7 +94,7 @@ app = FastAPI(
         "As pessoas e suas fotos (base64) vêm da tabela `pessoa`, alimentada por "
         "outra API. Aqui só são gravados os logs de entrada/saída."
     ),
-    version="1.3.3",
+    version="1.3.4",
     lifespan=lifespan,
 )
 
@@ -152,7 +152,8 @@ class LogRecord(BaseModel):
 # Rotas
 # ---------------------------------------------------------------------------
 
-@app.get("/health")
+# HEAD também: monitores de uptime (ex.: UptimeRobot) checam com HEAD e recebiam 405
+@app.api_route("/health", methods=["GET", "HEAD"])
 def health():
     return {
         "status": "ok",
@@ -165,7 +166,7 @@ def health():
     }
 
 
-@app.get("/", include_in_schema=False)
+@app.api_route("/", methods=["GET", "HEAD"], include_in_schema=False)
 def root():
     return RedirectResponse(url="/docs")
 
