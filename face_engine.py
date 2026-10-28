@@ -73,6 +73,7 @@ def get_engine():
                 name=config.FACE_MODEL,
                 allowed_modules=["detection", "recognition"],
                 providers=["CPUExecutionProvider"],
+                sess_options=_session_options(),
                 liveness_mode="normal",  # rosto reprovado não gera embedding
                 liveness_threshold=config.LIVENESS_THRESHOLD,
             )
@@ -102,6 +103,23 @@ def get_engine():
 def is_loaded() -> bool:
     """True quando o modelo já foi carregado e aquecido."""
     return _APP is not None
+
+
+def _session_options():
+    """
+    Opções das sessões ONNX do detector e do ArcFace.
+
+    Por padrão o ONNX Runtime abre uma thread por núcleo da MÁQUINA, não do
+    plano contratado: no Render (fração de núcleo) elas só brigam pela CPU.
+    ORT_THREADS limita (veja config.py).
+    """
+    import onnxruntime as ort
+
+    so = ort.SessionOptions()
+    if config.ORT_THREADS > 0:
+        so.intra_op_num_threads = config.ORT_THREADS
+        so.inter_op_num_threads = 1
+    return so
 
 
 def _build_liveness():
